@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
+#include <pybind11/embed.h>
 #include <sw/redis++/redis++.h>
 #include <string>
 #include <vector>
@@ -19,6 +20,9 @@ public:
     
 private:
     Redis redis;
+    py::object torch;
+    py::object sentence_transformers;
+    py::object model;
     
     std::vector<std::pair<std::string, std::vector<float>>> get_docs_and_embeddings(
         const std::vector<std::string>& keys);
@@ -33,23 +37,32 @@ RAG::RAG(const std::string& redis_host, int redis_port)
     try {
         auto pong = redis.ping();
         std::cout << "Conexión a Redis exitosa: " << pong << std::endl;
+
+        torch = py::module::import("torch");
+        sentence_transformers = py::module::import("sentence_transformers");
+        model = sentence_transformers.attr("SentenceTransformer")("all-MiniLM-L6-v2");
     } catch (const Error& e) {
         throw std::runtime_error("Error conectando a Redis: " + std::string(e.what()));
+    } catch (const py::error_already_set& e) {
+        throw std::runtime_error("Error inicializando Python: " + std::string(e.what()));
     }
 }
 
 std::vector<float> RAG::get_query_embedding(const std::string& query) {
-    OptionalString emb_str = redis.get("query:" + query);
-    if (!emb_str) {
-        throw std::runtime_error("Embedding de la query no encontrado en Redis");
+    auto embeddings = model.attr("encode")(std::vector<std::string>{query}, 
+                                          py::arg("convert_to_tensor") = true);
+    auto numpy_array = embeddings.attr("cpu")().attr("numpy")();
+    auto array = numpy_array.cast<py::array_t<float>>();
+    
+    auto buffer = array.request();
+    float* ptr = static_cast<float*>(buffer.ptr);
+    size_t embedding_size = buffer.shape[1];
+    
+    std::vector<float> embedding(embedding_size);
+    for (size_t j = 0; j < embedding_size; j++) {
+        embedding[j] = ptr[j];
     }
     
-    std::vector<float> embedding;
-    std::stringstream ss(*emb_str);
-    std::string value;
-    while (std::getline(ss, value, ',')) {
-        embedding.push_back(std::stof(value));
-    }
     return embedding;
 }
 
@@ -58,7 +71,6 @@ std::vector<std::pair<std::string, std::vector<float>>> RAG::get_docs_and_embedd
     std::vector<std::pair<std::string, std::vector<float>>> docs_and_embs;
     
     for (const auto& key : keys) {
-        // Obtener el embedding
         OptionalString emb_str = redis.get(key + ":emb");
         if (!emb_str) {
             throw std::runtime_error("Embedding no encontrado para la clave: " + key + ":emb");
@@ -71,7 +83,6 @@ std::vector<std::pair<std::string, std::vector<float>>> RAG::get_docs_and_embedd
             embedding.push_back(std::stof(value));
         }
         
-        // Obtener el texto del documento
         OptionalString text = redis.get(key + ":text");
         if (!text) {
             throw std::runtime_error("Texto no encontrado para la clave: " + key + ":text");
@@ -105,7 +116,7 @@ std::vector<std::string> RAG::retrieve_relevant_docs(
              [](auto& a, auto& b) { return a.first > b.first; });
     
     std::vector<std::string> relevant_docs;
-    relevant_docs.push_back(docs_and_embs[similarities[0].second].first); // Devolver el texto
+    relevant_docs.push_back(docs_and_embs[similarities[0].second].first);
     return relevant_docs;
 }
 
